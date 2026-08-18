@@ -1,30 +1,55 @@
 """
-Writes the final 4-sheet workbook with openpyxl, reproducing the reference
-workbook's sheet order, column layout, number formats, fonts/fills/borders,
-freeze panes, autofilters, column widths/row heights, and live formulas.
+Writes the final workbook by editing the reference workbook IN PLACE as a
+live template, rather than rebuilding one from scratch with openpyxl.
 
-Sheet write order matters: Allocation must be written first because its
-column layout (which depends on how many distinct plants are in this run's
-sales-order data) determines the exact cell references used by Old report's
-Allocation-lookup formulas.
+Why: the reference file's "Allocation" sheet is a real, native Excel
+PivotTable, and its source range is 'Overstock'!A1:AE1048576 -- i.e. the
+pivot reads directly off the Overstock sheet in the same workbook. openpyxl
+round-trips that PivotTable's XML intact (verified: load + save reproduces
+the same cacheSource, cacheFields, and pivotFields). So instead of trying
+to fabricate pivot-cache XML ourselves (unsupported, corruption-prone), we:
+
+  1. Load the reference workbook as a template.
+  2. Overwrite the data rows of Overstock / Price List / Old report with
+     this run's data, resizing each sheet's row count and cloning the
+     template's own cell styles onto any newly-inserted rows -- so every
+     font, fill, border, number format, column width, freeze pane, and
+     autofilter is inherited automatically instead of hand re-implemented.
+  3. Set the PivotTable's cache to refreshOnLoad=1 and force ascending
+     sort on the Material/Plant fields, so Excel recomputes a fresh,
+     correctly laid-out pivot the moment the file is opened.
+  4. Also pre-populate the pivot's own A:G cells with the exact values our
+     own aggregation (src/allocation.py) computes -- identical to what
+     Excel's live refresh will produce -- so the sheet looks correct even
+     before any refresh happens, and rebuild the manually-added "Unique
+     Key" helper column (H) to match that same row range.
+
+This keeps the PivotTable genuinely native (field list, drill-down,
+right-click Refresh all work), while guaranteeing correct-looking data on
+first open regardless of refresh timing.
 """
 from __future__ import annotations
 
+from copy import copy
+from pathlib import Path
+
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles.colors import Color
+from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from src import config
 from src.allocation import AllocationResult
 from src.old_report import ALLOCATION_COLUMN_LETTER_FIELD
 
-_REGULAR_FONT = Font(name=config.FONT_NAME, size=config.FONT_SIZE)
-_BOLD_FONT = Font(name=config.FONT_NAME, size=config.FONT_SIZE, bold=True)
-_HEADER_FILL = PatternFill(patternType="solid", fgColor=config.HEADER_FILL_RGB)
-_THIN = Side(style="thin")
-_THIN_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "assets" / "report_template.xlsx"
+
+# Fixed cacheField positions in the reference workbook's Overstock column
+# order (0-indexed) -- these only stay valid because OVERSTOCK_COLUMNS is
+# never reordered relative to the reference file.
+_MATERIAL_PIVOT_FIELD_INDEX = config.OVERSTOCK_COLUMNS.index("Material")
+_PLANT_PIVOT_FIELD_INDEX = config.OVERSTOCK_COLUMNS.index("Plant")
 
 
 def _clean(value):
@@ -37,138 +62,62 @@ def _clean(value):
     return value
 
 
-def _set_widths(ws, widths: dict[str, float]):
-    for col, width in widths.items():
-        ws.column_dimensions[col].width = width
-
-
-# ---------------------------------------------------------------------------
-# Allocation
-# ---------------------------------------------------------------------------
-def _write_allocation_sheet(wb: Workbook, allocation: AllocationResult):
-    ws = wb.create_sheet("Allocation")
-
-    n_plants = len(allocation.plants)
-    grand_total_col_idx = 2 + n_plants
-    unique_key_col_idx = grand_total_col_idx + 1
-    grand_total_letter = get_column_letter(grand_total_col_idx)
-    unique_key_letter = get_column_letter(unique_key_col_idx)
-
-    ws["A3"] = "Sum of Confirmed Quantity (CS)"
-    ws["A3"].font = _REGULAR_FONT
-    ws["B3"] = "Column Labels"
-    ws["B3"].font = _REGULAR_FONT
-
-    center = Alignment(horizontal="center", vertical="center")
-    center_wrap = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    ws.cell(4, 1, "Row Labels").font = _REGULAR_FONT
-    ws.cell(4, 1).border = _THIN_BORDER
-    for idx, plant in enumerate(allocation.plants):
-        cell = ws.cell(4, 2 + idx, plant)
-        cell.font = _REGULAR_FONT
-        cell.alignment = center
-        cell.border = _THIN_BORDER
-    gt_header = ws.cell(4, grand_total_col_idx, "Grand Total")
-    gt_header.font = _REGULAR_FONT
-    gt_header.alignment = center
-    gt_header.border = _THIN_BORDER
-    key_header = ws.cell(4, unique_key_col_idx, "Unique Key")
-    key_header.font = _BOLD_FONT
-    key_header.alignment = center_wrap
-    key_header.fill = PatternFill(patternType="solid", fgColor=Color(theme=4, tint=0.7999816888943144))
-
-    row = 5
-    for material in allocation.materials:
-        ws.cell(row, 1, material).font = _REGULAR_FONT
-        ws.cell(row, 1).border = _THIN_BORDER
-        for idx, plant in enumerate(allocation.plants):
-            val = allocation.grid[material][plant]
-            cell = ws.cell(row, 2 + idx, val)
-            cell.font = _REGULAR_FONT
-            cell.border = _THIN_BORDER
-        gt_cell = ws.cell(row, grand_total_col_idx, allocation.row_totals[material])
-        gt_cell.font = _REGULAR_FONT
-        gt_cell.border = _THIN_BORDER
-        key_cell = ws.cell(row, unique_key_col_idx, f'=A{row} & "_" & {config.UNIQUE_KEY_SUFFIX}')
-        key_cell.font = _REGULAR_FONT
-        row += 1
-
-    # Grand Total row
-    ws.cell(row, 1, "Grand Total").font = _REGULAR_FONT
-    ws.cell(row, 1).border = _THIN_BORDER
-    for idx, plant in enumerate(allocation.plants):
-        cell = ws.cell(row, 2 + idx, allocation.col_totals[plant])
-        cell.font = _REGULAR_FONT
-        cell.border = _THIN_BORDER
-    gt_cell = ws.cell(row, grand_total_col_idx, allocation.grand_total)
-    gt_cell.font = _REGULAR_FONT
-    gt_cell.border = _THIN_BORDER
-    ws.cell(row, unique_key_col_idx, f'=A{row} & "_" & {config.UNIQUE_KEY_SUFFIX}').font = _REGULAR_FONT
-
-    _set_widths(ws, config.COLUMN_WIDTHS["Allocation"])
-    return unique_key_letter
+def _sync_row_count(ws, old_last_row: int, new_last_row: int, style_template_row: int, n_cols: int):
+    """Grows or shrinks a sheet's data rows to exactly new_last_row,
+    cloning cell styles from style_template_row onto any newly-inserted
+    rows so they stay formatted like the rest of the column."""
+    if new_last_row > old_last_row:
+        n_new = new_last_row - old_last_row
+        ws.insert_rows(old_last_row + 1, amount=n_new)
+        for r in range(old_last_row + 1, new_last_row + 1):
+            for c in range(1, n_cols + 1):
+                src = ws.cell(style_template_row, c)
+                dst = ws.cell(r, c)
+                dst.font = copy(src.font)
+                dst.fill = copy(src.fill)
+                dst.border = copy(src.border)
+                dst.alignment = copy(src.alignment)
+                dst.number_format = src.number_format
+    elif new_last_row < old_last_row:
+        ws.delete_rows(new_last_row + 1, old_last_row - new_last_row)
 
 
 # ---------------------------------------------------------------------------
 # Overstock
 # ---------------------------------------------------------------------------
 def _write_overstock_sheet(wb: Workbook, overstock_df: pd.DataFrame):
-    ws = wb.create_sheet("Overstock")
+    ws = wb["Overstock"]
     columns = config.OVERSTOCK_COLUMNS
+    old_last_row = ws.max_row
+    new_last_row = overstock_df.shape[0] + 1
 
-    for c_idx, col_name in enumerate(columns, start=1):
-        cell = ws.cell(1, c_idx, col_name)
-        cell.font = _BOLD_FONT
-        cell.fill = _HEADER_FILL
-        align = config.OVERSTOCK_HEADER_ALIGN.get(col_name)
-        vertical = "center" if align else None
-        cell.alignment = Alignment(horizontal=align, vertical=vertical, wrap_text=True)
+    _sync_row_count(ws, old_last_row, new_last_row, style_template_row=2, n_cols=len(columns))
 
     for r_idx, (_, row) in enumerate(overstock_df.iterrows(), start=2):
         for c_idx, col_name in enumerate(columns, start=1):
-            cell = ws.cell(r_idx, c_idx, _clean(row[col_name]))
-            cell.font = _REGULAR_FONT
-            fmt = config.OVERSTOCK_NUMBER_FORMATS.get(col_name)
-            if fmt:
-                cell.number_format = fmt
+            ws.cell(r_idx, c_idx, _clean(row[col_name]))
 
-    ws.row_dimensions[1].height = config.HEADER_ROW_HEIGHT["Overstock"]
-    ws.freeze_panes = config.FREEZE_PANES["Overstock"]
-    last_row = max(overstock_df.shape[0] + 1, 1)
     last_col = get_column_letter(len(columns))
-    ws.auto_filter.ref = f"A1:{last_col}{last_row}"
-    _set_widths(ws, config.COLUMN_WIDTHS["Overstock"])
+    ws.auto_filter.ref = f"A1:{last_col}{new_last_row}"
 
 
 # ---------------------------------------------------------------------------
 # Price List
 # ---------------------------------------------------------------------------
 def _write_price_list_sheet(wb: Workbook, price_list_df: pd.DataFrame):
-    ws = wb.create_sheet("Price List")
+    ws = wb["Price List"]
     columns = config.PRICE_LIST_COLUMNS
+    old_last_row = ws.max_row
+    new_last_row = price_list_df.shape[0] + 1
 
-    for c_idx, col_name in enumerate(columns, start=1):
-        cell = ws.cell(1, c_idx, col_name)
-        cell.font = _BOLD_FONT
-        cell.fill = _HEADER_FILL
-        align = config.PRICE_LIST_HEADER_ALIGN.get(col_name)
-        vertical = "center" if align else None
-        cell.alignment = Alignment(horizontal=align, vertical=vertical)
+    _sync_row_count(ws, old_last_row, new_last_row, style_template_row=2, n_cols=len(columns))
 
     for r_idx, (_, row) in enumerate(price_list_df.iterrows(), start=2):
         for c_idx, col_name in enumerate(columns, start=1):
-            cell = ws.cell(r_idx, c_idx, _clean(row[col_name]))
-            cell.font = _REGULAR_FONT
-            fmt = config.PRICE_LIST_NUMBER_FORMATS.get(col_name)
-            if fmt:
-                cell.number_format = fmt
+            ws.cell(r_idx, c_idx, _clean(row[col_name]))
 
-    ws.freeze_panes = config.FREEZE_PANES["Price List"]
-    last_row = max(price_list_df.shape[0] + 1, 1)
     last_col = get_column_letter(len(columns))
-    ws.auto_filter.ref = f"A1:{last_col}{last_row}"
-    _set_widths(ws, config.COLUMN_WIDTHS["Price List"])
+    ws.auto_filter.ref = f"A1:{last_col}{new_last_row}"
 
 
 # ---------------------------------------------------------------------------
@@ -177,28 +126,22 @@ def _write_price_list_sheet(wb: Workbook, price_list_df: pd.DataFrame):
 def _write_old_report_sheet(
     wb: Workbook,
     old_report_df: pd.DataFrame,
-    allocation: AllocationResult,
     allocation_unique_key_letter: str,
 ):
-    ws = wb.create_sheet("Old report")
+    ws = wb["Old report"]
     columns = config.OLD_REPORT_COLUMNS
+    old_last_row = ws.max_row
+    new_last_row = old_report_df.shape[0] + 1
+
+    _sync_row_count(ws, old_last_row, new_last_row, style_template_row=2, n_cols=len(columns))
 
     price_list_letter = {
         name: get_column_letter(idx + 1) for idx, name in enumerate(config.PRICE_LIST_COLUMNS)
     }
 
-    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for c_idx, col_name in enumerate(columns, start=1):
-        cell = ws.cell(1, c_idx, col_name)
-        cell.font = _BOLD_FONT
-        cell.fill = _HEADER_FILL
-        cell.alignment = header_align
-
     for r_offset, (_, src_row) in enumerate(old_report_df.iterrows()):
         r = r_offset + 2
 
-        # Formula-driven columns, matching the reference workbook's exact
-        # formula structure (whole-column XLOOKUP references).
         ws.cell(r, 1, f"=_xlfn.XLOOKUP(C:C,'Price List'!C:C,'Price List'!{price_list_letter['BDM']}:{price_list_letter['BDM']})")
         ws.cell(r, 2, _clean(src_row["Material Group Name"]))
         ws.cell(r, 3, _clean(src_row["Material"]))
@@ -222,26 +165,86 @@ def _write_old_report_sheet(
                 f"Allocation!{alloc_col_letter}:{alloc_col_letter},0)",
             )
         else:
-            # Selling plant has no confirmed-order data in this run at all,
-            # so the Allocation figure is definitionally 0 (same fallback
-            # XLOOKUP itself would use if the lookup failed).
             ws.cell(r, 15, 0)
 
         ws.cell(r, 16, f"=M{r}-O{r}")
 
-        for c_idx, col_name in enumerate(columns, start=1):
-            cell = ws.cell(r, c_idx)
-            cell.font = _REGULAR_FONT
-            fmt = config.OLD_REPORT_NUMBER_FORMATS.get(col_name)
-            if fmt:
-                cell.number_format = fmt
+    ws.auto_filter.ref = f"A1:{config.OLD_REPORT_AUTOFILTER_LAST_COLUMN}{new_last_row}"
 
-    ws.row_dimensions[1].height = config.HEADER_ROW_HEIGHT["Old report"]
-    ws.freeze_panes = config.FREEZE_PANES["Old report"]
-    last_row = max(old_report_df.shape[0] + 1, 1)
-    ws.auto_filter.ref = f"A1:{config.OLD_REPORT_AUTOFILTER_LAST_COLUMN}{last_row}"
-    _set_widths(ws, config.COLUMN_WIDTHS["Old report"])
-    return ws
+
+# ---------------------------------------------------------------------------
+# Allocation (real PivotTable, pre-populated + set to refresh live)
+# ---------------------------------------------------------------------------
+def _write_allocation_sheet(wb: Workbook, allocation: AllocationResult, sales_order_row_count: int) -> str:
+    ws = wb["Allocation"]
+    pt = ws._pivots[0]
+
+    n_plants = len(allocation.plants)
+    grand_total_col_idx = 2 + n_plants
+    unique_key_col_idx = grand_total_col_idx + 1
+    grand_total_letter = get_column_letter(grand_total_col_idx)
+    unique_key_letter = get_column_letter(unique_key_col_idx)
+
+    old_last_row = ws.max_row
+    old_last_col = ws.max_column
+    new_last_row = 5 + len(allocation.materials)  # header rows 3-4, data starts row 5, +1 grand-total row
+
+    _sync_row_count(ws, old_last_row, new_last_row, style_template_row=5, n_cols=unique_key_col_idx)
+
+    # The template's plant-column count (and therefore where Grand Total /
+    # Unique Key land) depends on this run's data and can be narrower than
+    # the template's own. Clear any stale trailing columns left over from
+    # the template's wider layout so old labels/values don't linger next to
+    # the new ones.
+    if old_last_col > unique_key_col_idx:
+        for r in range(3, max(old_last_row, new_last_row) + 1):
+            for c in range(unique_key_col_idx + 1, old_last_col + 1):
+                ws.cell(r, c).value = None
+    elif grand_total_col_idx > old_last_col:
+        # This run has more distinct plants than the template did -- clone
+        # an existing pivot-body column's style onto the new columns so
+        # they stay visually consistent (thin borders, matching font).
+        for r in range(4, new_last_row + 1):
+            style_src = ws.cell(r, 2)
+            for c in range(old_last_col + 1, grand_total_col_idx + 1):
+                dst = ws.cell(r, c)
+                dst.font = copy(style_src.font)
+                dst.border = copy(style_src.border)
+                dst.alignment = copy(style_src.alignment)
+
+    # Header row (row 4): plant labels, Grand Total, Unique Key.
+    for idx, plant in enumerate(allocation.plants):
+        ws.cell(4, 2 + idx, plant)
+    ws.cell(4, grand_total_col_idx, "Grand Total")
+    key_header = ws.cell(4, unique_key_col_idx, "Unique Key")
+    key_header.font = Font(name="Arial", size=11, bold=True)
+    key_header.fill = PatternFill(patternType="solid", fgColor=Color(theme=4, tint=0.7999816888943144))
+
+    row = 5
+    for material in allocation.materials:
+        ws.cell(row, 1, material)
+        for idx, plant in enumerate(allocation.plants):
+            ws.cell(row, 2 + idx, allocation.grid[material][plant])
+        ws.cell(row, grand_total_col_idx, allocation.row_totals[material])
+        ws.cell(row, unique_key_col_idx, f'=A{row} & "_" & {config.UNIQUE_KEY_SUFFIX}')
+        row += 1
+
+    ws.cell(row, 1, "Grand Total")
+    for idx, plant in enumerate(allocation.plants):
+        ws.cell(row, 2 + idx, allocation.col_totals[plant])
+    ws.cell(row, grand_total_col_idx, allocation.grand_total)
+    ws.cell(row, unique_key_col_idx, f'=A{row} & "_" & {config.UNIQUE_KEY_SUFFIX}')
+
+    # Make this a genuinely live, refreshable PivotTable: force a fresh
+    # recompute from the (new) Overstock data on open, sorted ascending so
+    # the refreshed layout matches what we just pre-populated above.
+    pt.cache.refreshOnLoad = True
+    pt.cache.recordCount = sales_order_row_count
+    pt.pivotFields[_MATERIAL_PIVOT_FIELD_INDEX].sortType = "ascending"
+    pt.pivotFields[_PLANT_PIVOT_FIELD_INDEX].sortType = "ascending"
+    pt.location.ref = f"A3:{grand_total_letter}{row}"
+
+    return unique_key_letter
 
 
 def build_workbook(
@@ -250,14 +253,14 @@ def build_workbook(
     old_report_df: pd.DataFrame,
     allocation: AllocationResult,
 ) -> Workbook:
-    wb = Workbook()
-    wb.remove(wb.active)
+    wb = load_workbook(TEMPLATE_PATH)
 
-    unique_key_letter = _write_allocation_sheet(wb, allocation)
+    # Allocation must be written first: its column layout (which depends on
+    # how many distinct plants are in this run's data) determines the exact
+    # cell references Old report's formulas need.
+    unique_key_letter = _write_allocation_sheet(wb, allocation, overstock_df.shape[0])
     _write_overstock_sheet(wb, overstock_df)
     _write_price_list_sheet(wb, price_list_df)
-    old_report_ws = _write_old_report_sheet(wb, old_report_df, allocation, unique_key_letter)
+    _write_old_report_sheet(wb, old_report_df, unique_key_letter)
 
-    old_report_ws.sheet_view.tabSelected = True
-    wb.active = wb.sheetnames.index("Old report")
     return wb
