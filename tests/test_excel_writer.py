@@ -67,20 +67,63 @@ def test_pivot_set_to_refresh_live_and_sorted_ascending():
     assert pt.pivotFields[config.OVERSTOCK_COLUMNS.index("Plant")].sortType == "ascending"
 
 
-def test_allocation_sheet_has_no_stale_trailing_columns():
+def test_allocation_sheet_pivot_location_and_cells_are_left_for_excel_to_refresh():
+    # Verified against real Excel (COM): pre-editing the pivot's own
+    # location.ref/header/data cells before its refreshOnLoad-triggered
+    # refresh runs makes that refresh collapse to a single #SPILL! cell
+    # instead of resizing cleanly. Excel's native refresh already
+    # resizes/repopulates the pivot correctly on its own, so
+    # _write_allocation_sheet must leave the pivot's own output area alone
+    # and only configure the cache (record count, sort order, refresh flag).
     wb = _build()
     ws = wb["Allocation"]
-    # One plant (2910) -> B=2910, C=Grand Total, D=Unique Key; nothing past D.
-    assert ws.cell(4, 5).value is None
-    assert ws.cell(5, 5).value is None
+    pt = ws._pivots[0]
+    assert pt.location.ref == "A3:G117"  # untouched template value, not shrunk to this run's size
 
 
-def test_old_report_formula_references_correct_dynamic_allocation_column():
+def test_old_report_allocation_is_a_plain_value_not_a_pivot_formula():
+    # Verified against real Excel (COM), including a genuine interactive
+    # Ctrl+Alt+F9 full recalculation: ANY formula referencing the Allocation
+    # pivot's output cells -- plain cell reference, INDEX/MATCH, or even
+    # GETPIVOTDATA -- gets stuck at a stale/error-caught value from before
+    # the pivot's refreshOnLoad refresh completes, and nothing short of
+    # literally re-entering the formula fixes it. So Allocation is written
+    # as a plain number, computed the same way the pivot itself aggregates,
+    # which has no such failure mode and can't be misaligned by a later row
+    # deletion in "Old report" either -- it just moves/deletes with its row.
     wb = _build()
     ws = wb["Old report"]
-    formula = ws.cell(2, 15).value
-    assert "Allocation!D:D" in formula  # Unique Key column for a single-plant run
-    assert "Allocation!B:B" in formula  # 2910's own column
+    cell = ws.cell(2, 15)
+    assert cell.data_type == "n"  # numeric constant, not a formula ("f")
+    assert cell.value == 5  # tiny_sales_order_df: Material 10000001 @ 2910 confirmed qty 5
+
+
+def test_old_report_allocation_applies_city_pairing_for_3pl_plants():
+    # 3PL plants (2925/2935) don't take direct orders -- their Allocation
+    # figure must come from their city's TOL plant column instead.
+    sales_order_df = pd.DataFrame(
+        [
+            {**{c: None for c in config.OVERSTOCK_COLUMNS}, "Sales Order": "1", "Sales Order Item": "10",
+             "Material": "10000001", "Material Description": "X", "Confirmed Quantity (CS)": 9, "Plant": "2920"},
+        ]
+    )
+    materials_df = pd.DataFrame(
+        [
+            {
+                "Material Group Name": "G", "Material": "10000001", "Material Description": "X",
+                "Plant": "2925", "Plant Name": "Lineage Calgary", "Batch": "B1", "Storage Location": "1100",
+                "Shelf Life Expiration Date": pd.Timestamp("2027-01-01"), "Unrestricted Stock": 10,
+            }
+        ]
+    )
+    allocation = build_allocation(sales_order_df)
+    overstock_df = build_overstock(sales_order_df)
+    price_list_df = build_price_list(_tiny_pricing_df())
+    old_report_df = build_old_report(materials_df, allocation)
+    wb = build_workbook(overstock_df, price_list_df, old_report_df, allocation)
+
+    ws = wb["Old report"]
+    assert ws.cell(2, 15).value == 9  # 2925's own row picks up 2920's confirmed quantity
 
 
 def test_workbook_reopens_without_error():

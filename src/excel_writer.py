@@ -35,13 +35,10 @@ from pathlib import Path
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles.colors import Color
-from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from src import config
 from src.allocation import AllocationResult
-from src.old_report import ALLOCATION_COLUMN_LETTER_FIELD
 
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "assets" / "report_template.xlsx"
 
@@ -123,10 +120,19 @@ def _write_price_list_sheet(wb: Workbook, price_list_df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 # Old report
 # ---------------------------------------------------------------------------
+def _selling_plant(plant: str | None) -> str | None:
+    """Maps a Materials-export Plant to the selling-plant its Allocation
+    figure should come from, applying the city-pairing rule (3PL plants
+    don't take direct orders, so they pull from their city's TOL plant)."""
+    if plant is None:
+        return None
+    return config.PLANT_TO_SELLING_PLANT.get(plant, plant)
+
+
 def _write_old_report_sheet(
     wb: Workbook,
     old_report_df: pd.DataFrame,
-    allocation_unique_key_letter: str,
+    allocation: AllocationResult,
 ):
     ws = wb["Old report"]
     columns = config.OLD_REPORT_COLUMNS
@@ -157,15 +163,25 @@ def _write_old_report_sheet(
         ws.cell(r, 13, _clean(src_row["Unrestricted Stock"]))
         ws.cell(r, 14, f'=C{r} & "_" & {config.UNIQUE_KEY_SUFFIX}')
 
-        alloc_col_letter = src_row[ALLOCATION_COLUMN_LETTER_FIELD]
-        if alloc_col_letter:
-            ws.cell(
-                r, 15,
-                f"=_xlfn.XLOOKUP(N{r},Allocation!{allocation_unique_key_letter}:{allocation_unique_key_letter},"
-                f"Allocation!{alloc_col_letter}:{alloc_col_letter},0)",
-            )
-        else:
-            ws.cell(r, 15, 0)
+        # Allocation is written as a plain number computed here in Python
+        # (the exact same aggregation the Allocation pivot itself performs,
+        # via allocation.grid), not an Excel formula. Verified against real
+        # Excel (COM, including a genuine interactive Ctrl+Alt+F9 full
+        # recalculation) that ANY formula referencing the Allocation pivot's
+        # output cells -- plain cell reference, INDEX/MATCH, or even
+        # GETPIVOTDATA -- gets stuck at a stale/error value from before the
+        # pivot's refreshOnLoad refresh completes, and nothing short of
+        # literally re-entering the formula fixes it; Excel never wires a
+        # PivotTable's refresh into the recalculation of formulas elsewhere
+        # that read its output when that formula was authored outside Excel.
+        # A plain value has no such failure mode, and -- unlike the
+        # reference workbook's fragile per-row-baked column letter -- it is
+        # computed fresh from this row's own Material/Plant every run, so it
+        # can only ever be deleted along with its own row, never misaligned
+        # with a different one.
+        selling_plant = _selling_plant(src_row["Plant"])
+        alloc_value = allocation.grid.get(src_row["Material"], {}).get(selling_plant)
+        ws.cell(r, 15, alloc_value if alloc_value is not None else 0)
 
         ws.cell(r, 16, f"=M{r}-O{r}")
 
@@ -173,78 +189,29 @@ def _write_old_report_sheet(
 
 
 # ---------------------------------------------------------------------------
-# Allocation (real PivotTable, pre-populated + set to refresh live)
+# Allocation (real PivotTable, set to refresh live -- not pre-populated)
 # ---------------------------------------------------------------------------
-def _write_allocation_sheet(wb: Workbook, allocation: AllocationResult, sales_order_row_count: int) -> str:
+def _write_allocation_sheet(wb: Workbook, allocation: AllocationResult, sales_order_row_count: int) -> None:
+    """Configures the "Allocation" PivotTable to do a genuine live refresh
+    from the (new) Overstock data the moment the workbook is opened.
+
+    Deliberately does NOT touch the pivot's own output cells (header/data
+    grid), does NOT resize the sheet's row count, and does NOT set
+    pt.location.ref: verified against real Excel that pre-editing the
+    pivot's own displayed range before its refreshOnLoad-triggered refresh
+    runs causes that refresh to collapse the whole table to a single
+    #SPILL! cell instead of resizing cleanly -- Excel's native refresh
+    already resizes/repopulates a PivotTable correctly on its own when left
+    alone, so our only job is to point it at the right cache state (fresh
+    record count, ascending sort) and let Excel do the rest on open.
+    """
     ws = wb["Allocation"]
     pt = ws._pivots[0]
 
-    n_plants = len(allocation.plants)
-    grand_total_col_idx = 2 + n_plants
-    unique_key_col_idx = grand_total_col_idx + 1
-    grand_total_letter = get_column_letter(grand_total_col_idx)
-    unique_key_letter = get_column_letter(unique_key_col_idx)
-
-    old_last_row = ws.max_row
-    old_last_col = ws.max_column
-    new_last_row = 5 + len(allocation.materials)  # header rows 3-4, data starts row 5, +1 grand-total row
-
-    _sync_row_count(ws, old_last_row, new_last_row, style_template_row=5, n_cols=unique_key_col_idx)
-
-    # The template's plant-column count (and therefore where Grand Total /
-    # Unique Key land) depends on this run's data and can be narrower than
-    # the template's own. Clear any stale trailing columns left over from
-    # the template's wider layout so old labels/values don't linger next to
-    # the new ones.
-    if old_last_col > unique_key_col_idx:
-        for r in range(3, max(old_last_row, new_last_row) + 1):
-            for c in range(unique_key_col_idx + 1, old_last_col + 1):
-                ws.cell(r, c).value = None
-    elif grand_total_col_idx > old_last_col:
-        # This run has more distinct plants than the template did -- clone
-        # an existing pivot-body column's style onto the new columns so
-        # they stay visually consistent (thin borders, matching font).
-        for r in range(4, new_last_row + 1):
-            style_src = ws.cell(r, 2)
-            for c in range(old_last_col + 1, grand_total_col_idx + 1):
-                dst = ws.cell(r, c)
-                dst.font = copy(style_src.font)
-                dst.border = copy(style_src.border)
-                dst.alignment = copy(style_src.alignment)
-
-    # Header row (row 4): plant labels, Grand Total, Unique Key.
-    for idx, plant in enumerate(allocation.plants):
-        ws.cell(4, 2 + idx, plant)
-    ws.cell(4, grand_total_col_idx, "Grand Total")
-    key_header = ws.cell(4, unique_key_col_idx, "Unique Key")
-    key_header.font = Font(name="Arial", size=11, bold=True)
-    key_header.fill = PatternFill(patternType="solid", fgColor=Color(theme=4, tint=0.7999816888943144))
-
-    row = 5
-    for material in allocation.materials:
-        ws.cell(row, 1, material)
-        for idx, plant in enumerate(allocation.plants):
-            ws.cell(row, 2 + idx, allocation.grid[material][plant])
-        ws.cell(row, grand_total_col_idx, allocation.row_totals[material])
-        ws.cell(row, unique_key_col_idx, f'=A{row} & "_" & {config.UNIQUE_KEY_SUFFIX}')
-        row += 1
-
-    ws.cell(row, 1, "Grand Total")
-    for idx, plant in enumerate(allocation.plants):
-        ws.cell(row, 2 + idx, allocation.col_totals[plant])
-    ws.cell(row, grand_total_col_idx, allocation.grand_total)
-    ws.cell(row, unique_key_col_idx, f'=A{row} & "_" & {config.UNIQUE_KEY_SUFFIX}')
-
-    # Make this a genuinely live, refreshable PivotTable: force a fresh
-    # recompute from the (new) Overstock data on open, sorted ascending so
-    # the refreshed layout matches what we just pre-populated above.
     pt.cache.refreshOnLoad = True
     pt.cache.recordCount = sales_order_row_count
     pt.pivotFields[_MATERIAL_PIVOT_FIELD_INDEX].sortType = "ascending"
     pt.pivotFields[_PLANT_PIVOT_FIELD_INDEX].sortType = "ascending"
-    pt.location.ref = f"A3:{grand_total_letter}{row}"
-
-    return unique_key_letter
 
 
 def build_workbook(
@@ -255,12 +222,9 @@ def build_workbook(
 ) -> Workbook:
     wb = load_workbook(TEMPLATE_PATH)
 
-    # Allocation must be written first: its column layout (which depends on
-    # how many distinct plants are in this run's data) determines the exact
-    # cell references Old report's formulas need.
-    unique_key_letter = _write_allocation_sheet(wb, allocation, overstock_df.shape[0])
+    _write_allocation_sheet(wb, allocation, overstock_df.shape[0])
     _write_overstock_sheet(wb, overstock_df)
     _write_price_list_sheet(wb, price_list_df)
-    _write_old_report_sheet(wb, old_report_df, unique_key_letter)
+    _write_old_report_sheet(wb, old_report_df, allocation)
 
     return wb
