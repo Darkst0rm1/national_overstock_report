@@ -6,16 +6,23 @@ directly from the reference workbook
 "Overstock National report - Aug 4 2026 (1).xlsx" so the generated report
 matches it exactly. Do not add/remove/reorder entries without re-checking the
 reference file.
+
+The eligible-inventory / eligible-sales-order rules below were separately
+reverse-engineered against a second pair of reference files for the
+2026-08-24 run: "National Stock Overstock Aug 24 2026.xlsx to seperate and
+send (1).xlsx" (manually-prepared, authoritative) vs. "National Overstock
+Report - 2026-08-24 (1).xlsx" (the dashboard's un-filtered output at the
+time). See src/eligibility.py and src/fifo_allocation.py for how they're
+applied.
 """
 
 # ---------------------------------------------------------------------------
 # Materials export -> required source columns
 # ---------------------------------------------------------------------------
 # These are copied straight through into the "Old report" sheet (columns
-# B, C, D, H, I, J, K, L, M). "Material" also doubles as the join key used to
-# look BDM/Sold by KG/Pack/Size up in the Price List sheet.
+# B, C, D, H, I, J, K, L). "Material" also doubles as the join key used to
+# look BDM/Sold by KG/Pack/Size/DSD Price up in the Price List sheet.
 MATERIALS_REQUIRED_COLUMNS = [
-    "Material Group Name",
     "Material",
     "Material Description",
     "Plant",
@@ -138,7 +145,6 @@ PRICING_DATE_COLUMNS = ["Pricing Date"]
 # ---------------------------------------------------------------------------
 OLD_REPORT_COLUMNS = [
     "BDM",
-    "Material Group Name",
     "Material",
     "Material Description",
     "Sold by KG",
@@ -151,8 +157,10 @@ OLD_REPORT_COLUMNS = [
     "Shelf Life Expiration Date",
     "Unrestricted Stock",
     "Unique Key",
-    "Allocation",
+    "Allocated",
     "Available",
+    "DSD Price",
+    "Deal Price",
 ]
 
 # Business rule confirmed against the reference workbook: 3PL storage plants
@@ -168,12 +176,50 @@ PLANT_TO_SELLING_PLANT = {
     "2935": "2930",  # Lineage Surrey CS -> TOL Surrey
 }
 
-# Unique Key suffix used by both the Allocation sheet and the Old report
-# sheet in the reference workbook. It is a literal constant (not the row's
-# actual plant) -- the join between the two sheets is effectively by
-# Material only, since the suffix is identical on both sides. Reproduced
-# verbatim from the reference file's formulas.
-UNIQUE_KEY_SUFFIX = "2910"
+# ---------------------------------------------------------------------------
+# Eligible-inventory / eligible-sales-order rules
+# ---------------------------------------------------------------------------
+# Reverse-engineered against "National Stock Overstock Aug 24 2026.xlsx to
+# seperate and send (1).xlsx" (the manually-prepared, authoritative report)
+# vs. "National Overstock Report - 2026-08-24 (1).xlsx" (the dashboard's
+# un-filtered output). A material is in scope for the report only if ALL of:
+#
+#   1. Its Material code does not start with this prefix -- these are
+#      packaging/shipper SKUs (e.g. "50016409 BLUE DIAMOND EMPTY CARDBOARD
+#      SHIPPER"), never sellable stock.
+PACKAGING_MATERIAL_PREFIX = "50"
+
+#   2. Its BDM (looked up from the Material/pricing export by Material,
+#      first match) is not one of these reps. Verified against the Aug 24
+#      reference: every material handled by these three BDMs was excluded
+#      from the manual report's inventory and sales-order sheets with zero
+#      exceptions across their full material lists (RANA FOOD SERVICE,
+#      JONDAY, FRESCA MEXICAN FOODS, PUTTERS FS, BRICKMANS, and 9 other
+#      single-material brands all resolve to just these 3 BDMs), while every
+#      *other* BDM appears in both the kept and excluded rows. So exclusion
+#      is by BDM (a small, stable, reusable list), never by brand / Material
+#      Group Name (an unbounded, brand-specific list that would need
+#      updating every time the business adds a new food-service SKU).
+EXCLUDED_FOOD_SERVICE_BDMS = {"MIGUEL GUTIERREZ", "Karishma Salian", "JEREMY MAINGOT PR"}
+
+#   3. It has at least one row in the Material/pricing export at all --
+#      materials absent from Price List entirely (e.g. 10013786, "C2O COCO
+#      WATER GNGR LME TURM") were excluded from the Aug 24 reference despite
+#      passing both rules above. (Enforced in src/eligibility.py directly
+#      against the Price List DataFrame; no separate constant needed.)
+
+# Inventory rows are further restricted to a rolling shelf-life window
+# starting at the report date (see src/eligibility.filter_eligible_inventory
+# -- the report date is a Streamlit date_input, never hardcoded). Verified
+# exactly against the Aug 24 reference (report date 2026-08-24): all 271
+# reference rows have a Shelf Life Expiration Date in [8/24, 11/25]
+# inclusive, and that window explains 95 of the un-filtered dashboard's 145
+# extra rows with zero false positives/negatives.
+INVENTORY_WINDOW_DAYS = 93
+
+# Deal Price = DSD Price x (1 - 75%) = DSD Price x 0.25, per the reference
+# workbook's own "=P{r}*(1-0.75)" formula.
+DEAL_PRICE_DISCOUNT = 0.75
 
 # ---------------------------------------------------------------------------
 # Layout
@@ -186,5 +232,6 @@ UNIQUE_KEY_SUFFIX = "2910"
 # count -- are listed here.
 
 # The reference workbook's "Old report" autofilter deliberately stops at
-# column M (Unrestricted Stock), excluding Unique Key/Allocation/Available.
-OLD_REPORT_AUTOFILTER_LAST_COLUMN = "M"
+# column L (Unrestricted Stock), excluding Unique Key/Allocated/Available/
+# DSD Price/Deal Price.
+OLD_REPORT_AUTOFILTER_LAST_COLUMN = "L"

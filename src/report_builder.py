@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass, field
+from datetime import date
 
 from openpyxl import load_workbook
 
 from src import data_loader, validators
-from src.allocation import build_allocation
+from src.allocation import aggregate_allocations, build_allocation
+from src.eligibility import eligible_material_universe, filter_relevant_sales_orders
 from src.excel_writer import build_workbook
-from src.old_report import build_old_report
+from src.old_report import build_food_service_report, build_old_report
 from src.overstock import build_overstock
 from src.price_list import build_price_list
 
@@ -29,7 +31,7 @@ class ReportResult:
     workbook_bytes: bytes | None = None
 
 
-def generate_report(materials_file, sales_order_file, pricing_file) -> ReportResult:
+def generate_report(materials_file, sales_order_file, pricing_file, report_date: date) -> ReportResult:
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -58,12 +60,22 @@ def generate_report(materials_file, sales_order_file, pricing_file) -> ReportRes
         return ReportResult(success=False, errors=errors, warnings=warnings)
 
     try:
-        allocation = build_allocation(sales_order_df)
+        # Sales orders for materials outside the eligible universe (food-
+        # service-only BDMs, packaging SKUs, materials with no Price List
+        # entry) must not affect the Allocation sheet or FIFO consumption --
+        # see src/eligibility.py. The "Overstock" sheet itself stays the
+        # complete, un-filtered export (its own long-standing spec).
+        eligible_materials = eligible_material_universe(materials_df, pricing_df)
+        relevant_sales_order_df = filter_relevant_sales_orders(sales_order_df, eligible_materials)
+
+        allocation = build_allocation(relevant_sales_order_df)
+        allocation_totals = aggregate_allocations(relevant_sales_order_df)
         overstock_df = build_overstock(sales_order_df)
         price_list_df = build_price_list(pricing_df)
-        old_report_df = build_old_report(materials_df, allocation)
+        old_report_df = build_old_report(materials_df, pricing_df, allocation_totals, report_date)
+        food_service_df = build_food_service_report(materials_df, pricing_df, allocation_totals)
 
-        wb = build_workbook(overstock_df, price_list_df, old_report_df, allocation)
+        wb = build_workbook(overstock_df, price_list_df, old_report_df, allocation, food_service_df)
 
         buf = io.BytesIO()
         wb.save(buf)

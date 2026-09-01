@@ -20,6 +20,7 @@ import pandas as pd
 from openpyxl.utils import get_column_letter
 
 from src import config
+from src.normalize import normalize_identifier
 
 BLANK_LABEL = "(blank)"
 
@@ -113,3 +114,41 @@ def selling_plant_column_letter(result: AllocationResult, plant: str | None) -> 
         return None
     selling_plant = config.PLANT_TO_SELLING_PLANT.get(plant, plant)
     return result.plant_column_letter.get(selling_plant)
+
+
+def map_allocation_plant(plant) -> str | None:
+    """Resolves an inventory or sales-order Plant to the plant its
+    allocation figure is tracked under -- the single normalized mapping used
+    by both the Allocation sheet's column grouping (via
+    selling_plant_column_letter) and FIFO batch consumption
+    (aggregate_allocations / allocate_fifo_by_batch). Never a constant: each
+    plant maps via config.PLANT_TO_SELLING_PLANT, defaulting to itself."""
+    normalized = normalize_identifier(plant)
+    if normalized is None:
+        return None
+    return config.PLANT_TO_SELLING_PLANT.get(normalized, normalized)
+
+
+def aggregate_allocations(sales_order_df: pd.DataFrame) -> dict[tuple[str, str], float]:
+    """Sums Confirmed Quantity (CS) by (normalized Material, mapped
+    allocation Plant) -- the key FIFO consumption is tracked against.
+
+    Unlike build_allocation's pivot grid (built for the Allocation sheet's
+    display, keyed by each Plant literally as it appears in the sales-order
+    export, e.g. 2925 gets its own column), this collapses 3PL plants into
+    their TOL city up front: FIFO must consume from a single pool per
+    selling plant, not a plant-by-plant one."""
+    if sales_order_df.empty:
+        return {}
+    work = pd.DataFrame(
+        {
+            "material": sales_order_df["Material"].map(normalize_identifier),
+            "plant": sales_order_df["Plant"].map(map_allocation_plant),
+            "qty": pd.to_numeric(sales_order_df["Confirmed Quantity (CS)"], errors="coerce").fillna(0),
+        }
+    )
+    work = work.dropna(subset=["material", "plant"])
+    if work.empty:
+        return {}
+    totals = work.groupby(["material", "plant"])["qty"].sum()
+    return {key: float(value) for key, value in totals.items()}

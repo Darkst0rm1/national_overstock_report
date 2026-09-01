@@ -118,26 +118,14 @@ def _write_price_list_sheet(wb: Workbook, price_list_df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
-# Old report
+# Old report / Foodservice (same 17-column layout and formula pattern --
+# Foodservice is the rule-3 (excluded-BDM) population kept for future use)
 # ---------------------------------------------------------------------------
-def _selling_plant(plant: str | None) -> str | None:
-    """Maps a Materials-export Plant to the selling-plant its Allocation
-    figure should come from, applying the city-pairing rule (3PL plants
-    don't take direct orders, so they pull from their city's TOL plant)."""
-    if plant is None:
-        return None
-    return config.PLANT_TO_SELLING_PLANT.get(plant, plant)
-
-
-def _write_old_report_sheet(
-    wb: Workbook,
-    old_report_df: pd.DataFrame,
-    allocation: AllocationResult,
-):
-    ws = wb["Old report"]
+def _write_old_report_style_sheet(wb: Workbook, sheet_name: str, report_df: pd.DataFrame):
+    ws = wb[sheet_name]
     columns = config.OLD_REPORT_COLUMNS
     old_last_row = ws.max_row
-    new_last_row = old_report_df.shape[0] + 1
+    new_last_row = report_df.shape[0] + 1
 
     _sync_row_count(ws, old_last_row, new_last_row, style_template_row=2, n_cols=len(columns))
 
@@ -145,45 +133,41 @@ def _write_old_report_sheet(
         name: get_column_letter(idx + 1) for idx, name in enumerate(config.PRICE_LIST_COLUMNS)
     }
 
-    for r_offset, (_, src_row) in enumerate(old_report_df.iterrows()):
+    for r_offset, (_, src_row) in enumerate(report_df.iterrows()):
         r = r_offset + 2
 
-        ws.cell(r, 1, f"=_xlfn.XLOOKUP(C:C,'Price List'!C:C,'Price List'!{price_list_letter['BDM']}:{price_list_letter['BDM']})")
-        ws.cell(r, 2, _clean(src_row["Material Group Name"]))
-        ws.cell(r, 3, _clean(src_row["Material"]))
-        ws.cell(r, 4, _clean(src_row["Material Description"]))
-        ws.cell(r, 5, f"=_xlfn.XLOOKUP(C:C,'Price List'!C:C,'Price List'!{price_list_letter['Sold by Wt']}:{price_list_letter['Sold by Wt']})")
-        ws.cell(r, 6, f"=_xlfn.XLOOKUP(C:C,'Price List'!C:C,'Price List'!{price_list_letter['Pack']}:{price_list_letter['Pack']})")
-        ws.cell(r, 7, f"=_xlfn.XLOOKUP(C:C,'Price List'!C:C,'Price List'!{price_list_letter['Size']}:{price_list_letter['Size']})")
-        ws.cell(r, 8, _clean(src_row["Plant"]))
-        ws.cell(r, 9, _clean(src_row["Plant Name"]))
-        ws.cell(r, 10, _clean(src_row["Batch"]))
-        ws.cell(r, 11, _clean(src_row["Storage Location"]))
-        ws.cell(r, 12, _clean(src_row["Shelf Life Expiration Date"]))
-        ws.cell(r, 13, _clean(src_row["Unrestricted Stock"]))
-        ws.cell(r, 14, f'=C{r} & "_" & {config.UNIQUE_KEY_SUFFIX}')
+        ws.cell(r, 1, f"=_xlfn.XLOOKUP(B:B,'Price List'!C:C,'Price List'!{price_list_letter['BDM']}:{price_list_letter['BDM']})")
+        ws.cell(r, 2, _clean(src_row["Material"]))
+        ws.cell(r, 3, _clean(src_row["Material Description"]))
+        ws.cell(r, 4, f"=_xlfn.XLOOKUP(B:B,'Price List'!C:C,'Price List'!{price_list_letter['Sold by Wt']}:{price_list_letter['Sold by Wt']})")
+        ws.cell(r, 5, f"=_xlfn.XLOOKUP(B:B,'Price List'!C:C,'Price List'!{price_list_letter['Pack']}:{price_list_letter['Pack']})")
+        ws.cell(r, 6, f"=_xlfn.XLOOKUP(B:B,'Price List'!C:C,'Price List'!{price_list_letter['Size']}:{price_list_letter['Size']})")
+        ws.cell(r, 7, _clean(src_row["Plant"]))
+        ws.cell(r, 8, _clean(src_row["Plant Name"]))
+        ws.cell(r, 9, _clean(src_row["Batch"]))
+        ws.cell(r, 10, _clean(src_row["Storage Location"]))
+        ws.cell(r, 11, _clean(src_row["Shelf Life Expiration Date"]))
+        ws.cell(r, 12, _clean(src_row["Unrestricted Stock"]))
+        ws.cell(r, 13, _clean(src_row["Unique Key"]))
 
-        # Allocation is written as a plain number computed here in Python
-        # (the exact same aggregation the Allocation pivot itself performs,
-        # via allocation.grid), not an Excel formula. Verified against real
-        # Excel (COM, including a genuine interactive Ctrl+Alt+F9 full
-        # recalculation) that ANY formula referencing the Allocation pivot's
-        # output cells -- plain cell reference, INDEX/MATCH, or even
-        # GETPIVOTDATA -- gets stuck at a stale/error value from before the
-        # pivot's refreshOnLoad refresh completes, and nothing short of
-        # literally re-entering the formula fixes it; Excel never wires a
-        # PivotTable's refresh into the recalculation of formulas elsewhere
-        # that read its output when that formula was authored outside Excel.
-        # A plain value has no such failure mode, and -- unlike the
-        # reference workbook's fragile per-row-baked column letter -- it is
+        # Allocated is written as a plain number -- src/fifo_allocation.py
+        # has already consumed each Material/mapped-Plant's total confirmed
+        # quantity once, FIFO across that material/plant's batches -- not an
+        # Excel formula. Verified against real Excel (COM, including a
+        # genuine interactive Ctrl+Alt+F9 full recalculation) that ANY
+        # formula referencing the Allocation pivot's output cells -- plain
+        # cell reference, INDEX/MATCH, or even GETPIVOTDATA -- gets stuck at
+        # a stale/error value from before the pivot's refreshOnLoad refresh
+        # completes, and nothing short of literally re-entering the formula
+        # fixes it. A plain value has no such failure mode, and it is
         # computed fresh from this row's own Material/Plant every run, so it
-        # can only ever be deleted along with its own row, never misaligned
-        # with a different one.
-        selling_plant = _selling_plant(src_row["Plant"])
-        alloc_value = allocation.grid.get(src_row["Material"], {}).get(selling_plant)
-        ws.cell(r, 15, alloc_value if alloc_value is not None else 0)
+        # can only ever be deleted along with its own row, never
+        # misaligned with a different one.
+        ws.cell(r, 14, _clean(src_row["Allocated"]))
+        ws.cell(r, 15, f"=L{r}-N{r}")
 
-        ws.cell(r, 16, f"=M{r}-O{r}")
+        ws.cell(r, 16, f"=_xlfn.XLOOKUP(B:B,'Price List'!C:C,'Price List'!{price_list_letter['1 - Store Door']}:{price_list_letter['1 - Store Door']})")
+        ws.cell(r, 17, f"=P{r}*(1-{config.DEAL_PRICE_DISCOUNT})")
 
     ws.auto_filter.ref = f"A1:{config.OLD_REPORT_AUTOFILTER_LAST_COLUMN}{new_last_row}"
 
@@ -219,12 +203,14 @@ def build_workbook(
     price_list_df: pd.DataFrame,
     old_report_df: pd.DataFrame,
     allocation: AllocationResult,
+    food_service_df: pd.DataFrame,
 ) -> Workbook:
     wb = load_workbook(TEMPLATE_PATH)
 
     _write_allocation_sheet(wb, allocation, overstock_df.shape[0])
     _write_overstock_sheet(wb, overstock_df)
     _write_price_list_sheet(wb, price_list_df)
-    _write_old_report_sheet(wb, old_report_df, allocation)
+    _write_old_report_style_sheet(wb, "Old report", old_report_df)
+    _write_old_report_style_sheet(wb, "Foodservice", food_service_df)
 
     return wb

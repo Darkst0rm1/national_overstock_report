@@ -1,6 +1,11 @@
 import pandas as pd
 
-from src.allocation import build_allocation, selling_plant_column_letter
+from src.allocation import (
+    aggregate_allocations,
+    build_allocation,
+    map_allocation_plant,
+    selling_plant_column_letter,
+)
 
 
 def _sales_orders(rows):
@@ -90,3 +95,67 @@ def test_selling_plant_with_no_order_data_returns_none():
     # with 2920) has nothing to look up -- caller should fall back to a
     # literal 0 rather than reference a nonexistent column.
     assert selling_plant_column_letter(result, "2925") is None
+
+
+def test_map_allocation_plant_matches_the_required_table():
+    assert map_allocation_plant("2910") == "2910"
+    assert map_allocation_plant("2920") == "2920"
+    assert map_allocation_plant("2925") == "2920"
+    assert map_allocation_plant("2930") == "2930"
+    assert map_allocation_plant("2935") == "2930"
+
+
+def test_map_allocation_plant_defaults_unknown_plants_to_themselves():
+    assert map_allocation_plant("9999") == "9999"
+
+
+def test_map_allocation_plant_normalizes_numeric_input():
+    assert map_allocation_plant("2910.0") == "2910"
+
+
+def test_map_allocation_plant_none_for_missing():
+    assert map_allocation_plant(None) is None
+
+
+def test_aggregate_allocations_sums_by_material_and_mapped_plant():
+    df = _sales_orders(
+        [
+            ["10017617", "2910", 20],
+            ["10017617", "2920", 38],
+        ]
+    )
+    totals = aggregate_allocations(df)
+    assert totals[("10017617", "2910")] == 20
+    assert totals[("10017617", "2920")] == 38
+
+
+def test_aggregate_allocations_pools_3pl_plants_into_their_tol_city():
+    df = _sales_orders(
+        [
+            ["10000001", "2925", 5],
+            ["10000001", "2920", 3],
+        ]
+    )
+    totals = aggregate_allocations(df)
+    assert totals == {("10000001", "2920"): 8}
+
+
+def test_aggregate_allocations_duplicate_rows_sum_correctly():
+    df = _sales_orders(
+        [
+            ["10000001", "2910", 5],
+            ["10000001", "2910", 5],
+            ["10000001", "2910", 5],
+        ]
+    )
+    assert aggregate_allocations(df) == {("10000001", "2910"): 15}
+
+
+def test_aggregate_allocations_normalizes_numeric_material_ids():
+    df = _sales_orders([["10017617.0", "2910", 20]])
+    assert aggregate_allocations(df) == {("10017617", "2910"): 20}
+
+
+def test_aggregate_allocations_empty_input_returns_empty_dict():
+    df = pd.DataFrame(columns=["Material", "Plant", "Confirmed Quantity (CS)"])
+    assert aggregate_allocations(df) == {}
